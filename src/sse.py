@@ -952,6 +952,57 @@ class ToolCallAccumulator:
             candidate = f"{base}_{suffix}"
         return candidate
 
+    def _heal_open_call(self, call: dict) -> Optional[str]:
+        """Attach a mid-string argument fragment to the call it continues.
+
+        Trae occasionally resumes a native tool call after an upstream hiccup
+        (mid-stream ``event:error`` + gateway fallback, or a plan-item retry)
+        and then streams only the remaining fragment, e.g. ``'/Users/x && ls'``
+        instead of ``{"command":"'/Users/x && ls'``.  Such a fragment carries a
+        name but cannot be a call on its own: a fresh call always starts with
+        ``{`` or ``[``.  Appending it to the single open call of the same name
+        recovers the arguments instead of creating an unusable tail-only call
+        that used to abort the whole turn.
+        """
+
+        function = call.get("function") or {}
+        name = str(function.get("name") or "")
+        arguments = function.get("arguments")
+        if not name or not isinstance(arguments, str):
+            return None
+        head = arguments.lstrip()[:1]
+        if head in ("", "{", "["):
+            return None
+        requested_index = call.get("index")
+        upstream_id = str(call.get("_upstream_tool_call_id") or "")
+        candidates: list[str] = []
+        for existing_key in reversed(self._order):
+            existing = self._calls[existing_key]
+            existing_function = existing.get("function") or {}
+            if str(existing_function.get("name") or "") != name:
+                continue
+            existing_arguments = existing_function.get("arguments")
+            if not isinstance(existing_arguments, str) or not existing_arguments.strip():
+                continue
+            try:
+                json.loads(existing_arguments)
+            except Exception:
+                pass
+            else:
+                continue  # closed call: the fragment cannot belong to it
+            if isinstance(requested_index, int) and self._source_indexes.get(
+                existing_key
+            ) != requested_index:
+                continue
+            existing_id = str(existing.get("_upstream_tool_call_id") or "")
+            if upstream_id and existing_id and upstream_id != existing_id:
+                continue
+            candidates.append(existing_key)
+        if len(candidates) != 1:
+            return None
+        _dump_tool_frame("heal-attach", {"key": candidates[0], "fragment": arguments[:120]})
+        return candidates[0]
+
     def _existing_key(self, call: dict) -> Optional[str]:
         correlation = str(call.get("_correlation_key") or "")
         if correlation:
@@ -1141,7 +1192,11 @@ class ToolCallAccumulator:
             function = call["function"]
             call_id = call["id"]
             _dump_tool_frame("raw", call)
-            key = self._existing_key(call) or self._new_storage_key(call)
+            key = (
+                self._heal_open_call(call)
+                or self._existing_key(call)
+                or self._new_storage_key(call)
+            )
             _dump_tool_frame(
                 "keyed",
                 {
@@ -1476,6 +1531,7 @@ def _ensure_native_tool_arguments(
         _dump_tool_frame("ensure-entry", {"strict": bool(strict), "calls": calls})
     repaired_any = False
     kept: list[dict] = []
+    dropped: list[dict] = []
     for call in calls:
         function = call.get("function") or {}
         arguments = function.get("arguments")
@@ -1554,14 +1610,24 @@ def _ensure_native_tool_arguments(
             },
         )
         repaired_any = True
-        if strict:
-            raise InvalidNativeToolArguments(
-                "Trae upstream returned invalid JSON arguments for tool "
-                f"{function.get('name') or '?'}",
-                retryable=False,
-                usage=usage,
-                observed_model_event=True,
-            )
+        dropped.append(call)
+    if dropped and kept:
+        logger.warning(
+            "[tool-drop] dropped %d unusable call(s), kept %d usable call(s); "
+            "stream continues",
+            len(dropped),
+            len(kept),
+        )
+    elif dropped and strict:
+        # Nothing usable survived: let the caller retry instead of aborting the
+        # session with a permanent, non-retryable error.
+        raise InvalidNativeToolArguments(
+            "Trae upstream returned invalid JSON arguments for tool "
+            f"{(dropped[0].get('function') or {}).get('name') or '?'}",
+            retryable=True,
+            usage=usage,
+            observed_model_event=True,
+        )
     if repaired_any:
         logger.warning("[repair] repaired/split/dropped unusable tool call(s) this turn")
     return kept
