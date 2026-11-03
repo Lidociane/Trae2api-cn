@@ -431,15 +431,36 @@ def get_current_device() -> DeviceInfo:
     return _current_device
 
 
+# Relay/CLIProxyAPI 暴露的公开 id 带 ``trae/`` 前缀（插件 model-prefix=trae），
+# 而上游只认裸 config_name。前缀一旦漏到请求体，Trae 会回
+# ``4001 the param is invalid``，因此所有模型名解析入口统一先剥前缀。
+_TRAE_MODEL_PREFIX = "trae/"
+
+
+def strip_model_prefix(model: str) -> str:
+    """Drop a leading ``trae/`` provider prefix, preserving the raw model id."""
+
+    if not model:
+        return model
+    candidate = model.strip()
+    if candidate.lower().startswith(_TRAE_MODEL_PREFIX):
+        candidate = candidate[len(_TRAE_MODEL_PREFIX) :].strip()
+    return candidate or model
+
+
 def convert_model_name(model: str) -> str:
     """Map OpenAI/Claude-style names to Trae CN internal names.
 
     Preserve exact case for known upstream model names (the web upstream
-    matches custom_model.config_name precisely)."""
+    matches custom_model.config_name precisely).  A ``trae/`` provider prefix
+    is stripped first: it is a relay-side routing label and is never a valid
+    upstream ``config_name``.
+    """
     if not model:
         return model
-    m = model.strip().lower()
-    return _ALIAS_LOOKUP.get(m) or _UPSTREAM_MODEL_CASE.get(m) or model
+    candidate = strip_model_prefix(model)
+    m = candidate.lower()
+    return _ALIAS_LOOKUP.get(m) or _UPSTREAM_MODEL_CASE.get(m) or candidate
 
 
 async def _resolve_request_model_name(
@@ -459,7 +480,7 @@ async def _resolve_request_model_name(
     account catalog lookup.
     """
 
-    requested = str(model or "").strip()
+    requested = strip_model_prefix(str(model or "").strip())
     if not requested:
         return requested
     mapped = convert_model_name(requested)
