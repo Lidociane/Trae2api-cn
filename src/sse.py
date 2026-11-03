@@ -1001,6 +1001,13 @@ class ToolCallAccumulator:
         if len(candidates) != 1:
             return None
         _dump_tool_frame("heal-attach", {"key": candidates[0], "fragment": arguments[:120]})
+        # 生产可观测点：出现这行说明上游确实丢过参数头部，且本次已就地接回。
+        logger.warning(
+            "[heal] attached %d-char fragment to open call %s (%s)",
+            len(arguments),
+            candidates[0],
+            name,
+        )
         return candidates[0]
 
     def _existing_key(self, call: dict) -> Optional[str]:
