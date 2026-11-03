@@ -43,6 +43,23 @@ def _dump_tool_frame(stage: str, payload: Any) -> None:
     except Exception:  # pragma: no cover - diagnostics must never break a stream
         logger.warning("tool stream dump failed", exc_info=True)
 
+
+# Env-gated capture of the *verbatim* upstream SSE lines, so a truncated tool
+# argument can be attributed to the upstream or to the local accumulator.
+_RAW_STREAM_DUMP = (os.environ.get("TRAE_RAW_STREAM_DUMP") or "").strip()
+
+
+def _dump_raw_line(line: Any) -> None:
+    if not _RAW_STREAM_DUMP:
+        return
+    try:
+        text = line.decode("utf-8", "replace") if isinstance(line, bytes) else str(line)
+        record = {"ts": time.time(), "line": text[:8000]}
+        with open(_RAW_STREAM_DUMP, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:  # pragma: no cover
+        logger.warning("raw stream dump failed", exc_info=True)
+
 THINK_OPEN = " thinking\n\n"
 THINK_CLOSE = "\n response\n\n"
 
@@ -76,6 +93,7 @@ async def _iter_stream_lines(response) -> AsyncIterator[Any]:
 
     if hasattr(response, "__aiter__"):
         async for line in response:
+            _dump_raw_line(line)
             yield line
         return
 
@@ -102,6 +120,7 @@ async def _iter_stream_lines(response) -> AsyncIterator[Any]:
             read_task = None
             if not has_item:
                 return
+            _dump_raw_line(line)
             yield line
     finally:
         if read_task is not None and not read_task.done():
