@@ -25,6 +25,24 @@ from .cli_client import tool_call_signature as _tool_call_signature
 
 logger = logging.getLogger(__name__)
 
+# --- diagnostic: dump raw native tool frames (env-gated, off by default) ---
+# Set TRAE_TOOL_STREAM_DUMP=/app/data/tool-stream-debug.jsonl to capture every
+# normalized tool frame plus the key decisions taken by ToolCallAccumulator.
+# Used to tell "upstream sent a truncated fragment" apart from "the relay lost
+# the head while merging fragments". No behaviour change when unset.
+_TOOL_STREAM_DUMP = (os.environ.get("TRAE_TOOL_STREAM_DUMP") or "").strip()
+
+
+def _dump_tool_frame(stage: str, payload: Any) -> None:
+    if not _TOOL_STREAM_DUMP:
+        return
+    try:
+        record = {"ts": time.time(), "stage": stage, "payload": payload}
+        with open(_TOOL_STREAM_DUMP, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    except Exception:  # pragma: no cover - diagnostics must never break a stream
+        logger.warning("tool stream dump failed", exc_info=True)
+
 THINK_OPEN = " thinking\n\n"
 THINK_CLOSE = "\n response\n\n"
 
@@ -1103,7 +1121,21 @@ class ToolCallAccumulator:
                 continue
             function = call["function"]
             call_id = call["id"]
+            _dump_tool_frame("raw", call)
             key = self._existing_key(call) or self._new_storage_key(call)
+            _dump_tool_frame(
+                "keyed",
+                {
+                    "key": key,
+                    "call_id": call_id,
+                    "explicit_id": call.get("_explicit_id"),
+                    "explicit_index": call.get("_explicit_index"),
+                    "index": call.get("index"),
+                    "arguments_mode": call.get("_arguments_mode"),
+                    "name": function.get("name"),
+                    "arguments": function.get("arguments"),
+                },
+            )
             if key not in self._calls and not function.get("name"):
                 # 匹配不到任何已有调用的无 name 帧：只有以 { [ 开头才是新调用
                 # 起点；孤立的 } ] 空串是上游并发流的遗留闭合帧，直接丢弃。
@@ -1421,6 +1453,8 @@ def _ensure_native_tool_arguments(
     calls: list[dict], usage: Any = None, *, strict: bool = False
 ) -> list[dict]:
     """Validate/repair/split malformed native delta tool arguments."""
+    if _TOOL_STREAM_DUMP:
+        _dump_tool_frame("ensure-entry", {"strict": bool(strict), "calls": calls})
     repaired_any = False
     kept: list[dict] = []
     for call in calls:
@@ -1484,11 +1518,21 @@ def _ensure_native_tool_arguments(
         stripped = arguments.strip()
         if stripped in ("}", "]", "", "{}", "[]"):
             logger.warning("[drop] orphan closing fragment %r", stripped[:30])
+            _dump_tool_frame("drop-orphan", {"name": function.get("name"), "arguments": arguments})
             continue
         logger.warning(
             "[tool-drop] dropping unusable call %s args=%r",
             function.get("name") or "?",
             str(arguments)[:200],
+        )
+        _dump_tool_frame(
+            "tool-drop",
+            {
+                "strict": bool(strict),
+                "name": function.get("name"),
+                "arguments": arguments,
+                "all_calls": calls,
+            },
         )
         repaired_any = True
         if strict:
