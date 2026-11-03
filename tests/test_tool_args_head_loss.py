@@ -85,6 +85,38 @@ class HeadLossAccumulatorTests(unittest.TestCase):
         self.assertEqual(kept[0]["function"]["arguments"], '{"command":"ls"}')
 
 
+class HeadLossAmbiguityTests(unittest.TestCase):
+    """Ambiguous attachments must be refused, never guessed."""
+
+    def test_fragment_with_two_open_candidates_is_not_attached(self):
+        accumulator = sse.ToolCallAccumulator()
+        accumulator.add([{"index": 0, "id": "call_a",
+                          "function": {"name": "bash", "arguments": '{"command":"cd /Users/x'}}])
+        accumulator.add([{"index": 1, "id": "call_b",
+                          "function": {"name": "bash", "arguments": '{"command":"echo hi'}}])
+        # 无 index 的缺头续片：两个调用都可能，必须放弃接回而不是猜
+        accumulator.add([{"function": {"name": "bash", "arguments": ' && tail"'}}])
+        kept = sse._ensure_native_tool_arguments(accumulator.calls(), None, strict=True)
+        self.assertEqual(len(kept), 2)
+        for call in kept:
+            self.assertEqual(json.loads(call["function"]["arguments"]).__class__, dict)
+
+    def test_heredoc_payload_is_recovered_after_plan_switch(self):
+        command = "python3 - <<'PY'\nimport json\nd = {'a': \"x y\", 'b': [1, 2]}\nprint(json.dumps(d, ensure_ascii=False))\nPY"
+        payload = json.dumps({"command": command}, ensure_ascii=False)
+        head, tail = payload[: len(payload) // 2], payload[len(payload) // 2 :]
+        accumulator = sse.ToolCallAccumulator()
+        accumulator.add([{"index": 0, "id": "call_h",
+                          "function": {"name": "bash", "arguments": head},
+                          "_event_session_id": "s1", "_plan_item_id": "p1"}])
+        accumulator.add([{"index": 0,
+                          "function": {"name": "bash", "arguments": tail},
+                          "_event_session_id": "s2", "_plan_item_id": "p2"}])
+        kept = sse._ensure_native_tool_arguments(accumulator.calls(), None, strict=True)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(json.loads(kept[0]["function"]["arguments"])["command"], command)
+
+
 class HeadLossStreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_resumed_fragment_completes_the_turn(self):
         frames = _framed(
