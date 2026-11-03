@@ -1619,12 +1619,12 @@ def _ensure_native_tool_arguments(
             len(kept),
         )
     elif dropped and strict:
-        # Nothing usable survived: let the caller retry instead of aborting the
-        # session with a permanent, non-retryable error.
+        # Nothing usable survived. Keep the upstream contract (no silent replay)
+        # and surface the failure exactly as before.
         raise InvalidNativeToolArguments(
             "Trae upstream returned invalid JSON arguments for tool "
             f"{(dropped[0].get('function') or {}).get('name') or '?'}",
-            retryable=True,
+            retryable=False,
             usage=usage,
             observed_model_event=True,
         )
